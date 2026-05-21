@@ -22,6 +22,11 @@ MODEL_REGISTRY = {
         "input_size": (224, 224),
         "color_mode": "rgb",
         "preprocess": "efficientnet",
+        "thresholds": {
+            "normal": 0.35,
+            "borderline_normal": 0.50,
+            "borderline_tb": 0.65,
+        },
     },
     "best_model_epoch": {
         "file": "best_model_epoch.keras",
@@ -29,6 +34,11 @@ MODEL_REGISTRY = {
         "input_size": (64, 64),
         "color_mode": "grayscale",
         "preprocess": "scale_01",
+        "thresholds": {
+            "normal": 0.11,
+            "borderline_normal": 0.26,
+            "borderline_tb": 0.35,
+        },
     },
     "MMADUs_Tuberculosis_Detection": {
         "file": "MMADUs_Tuberculosis_Detection.keras",
@@ -36,11 +46,22 @@ MODEL_REGISTRY = {
         "input_size": (250, 250),
         "color_mode": "grayscale",
         "preprocess": "scale_01",
+        "thresholds": {
+            "normal": 0.35,
+            "borderline_normal": 0.50,
+            "borderline_tb": 0.65,
+        },
     },
 }
 
 DEFAULT_MODEL_ID = "tb_model_final_v3"
 MODEL_CACHE = {}
+
+UNIVERSAL_THRESHOLDS = {
+    "normal": 0.35,
+    "borderline_normal": 0.50,
+    "borderline_tb": 0.65,
+}
 
 
 def get_model(model_id: str):
@@ -84,15 +105,15 @@ def prepare_image(img_bytes: io.BytesIO, model_id: str):
     return x
 
 
-def classify_score(pred: float):
-    if pred < 0.11:
+def classify_score(pred: float, thresholds):
+    if pred < thresholds["normal"]:
         return {
             "label": "Normal",
             "decision": "Normal",
             "confidence": "High",
         }
 
-    if pred < 0.26:
+    if pred < thresholds["borderline_normal"]:
         return {
             "label": "Borderline - Likely Normal",
             "decision": "Borderline",
@@ -100,7 +121,7 @@ def classify_score(pred: float):
             "warning": "Manual review recommended",
         }
 
-    if pred < 0.35:
+    if pred < thresholds["borderline_tb"]:
         return {
             "label": "Borderline - Likely TB",
             "decision": "Borderline",
@@ -113,6 +134,34 @@ def classify_score(pred: float):
         "decision": "TB",
         "confidence": "High",
     }
+
+
+def normalize_score(pred: float, thresholds, universal):
+    pred = max(0.0, min(1.0, pred))
+
+    t1 = thresholds["normal"]
+    t2 = thresholds["borderline_normal"]
+    t3 = thresholds["borderline_tb"]
+
+    u1 = universal["normal"]
+    u2 = universal["borderline_normal"]
+    u3 = universal["borderline_tb"]
+
+    if pred <= t1:
+        return 0.0 if t1 == 0 else (pred / t1) * u1
+
+    if pred <= t2:
+        span = t2 - t1
+        return u1 if span == 0 else u1 + ((pred - t1) / span) * (u2 - u1)
+
+    if pred <= t3:
+        span = t3 - t2
+        return u2 if span == 0 else u2 + ((pred - t2) / span) * (u3 - u2)
+
+    if t3 >= 1:
+        return 1.0
+
+    return u3 + ((pred - t3) / (1 - t3)) * (1 - u3)
 
 
 @app.route("/", methods=["GET"])
@@ -179,12 +228,19 @@ def predict():
 
             pred = float(model.predict(x, verbose=0)[0][0])
 
-            classification = classify_score(pred)
+            thresholds = MODEL_REGISTRY[model_id]["thresholds"]
+            classification = classify_score(pred, thresholds)
+            normalized_score = normalize_score(
+                pred,
+                thresholds,
+                UNIVERSAL_THRESHOLDS,
+            )
 
             model_results.append({
                 "id": model_id,
                 "label": MODEL_REGISTRY[model_id]["label"],
-                "score": pred,
+                "score": normalized_score,
+                "raw_score": pred,
                 "decision": classification["decision"],
                 "detail": classification["label"],
                 "confidence": classification["confidence"],
